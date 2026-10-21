@@ -1,0 +1,646 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>netwatch — live network</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+      <circle cx="12" cy="12" r="2.4"/><path d="M6.5 6.5a7.8 7.8 0 0 0 0 11M17.5 6.5a7.8 7.8 0 0 1 0 11M3.6 3.6a11.9 11.9 0 0 0 0 16.8M20.4 3.6a11.9 11.9 0 0 1 0 16.8"/>
+    </svg>
+    <b>netwatch</b><span id="ver">live</span>
+  </div>
+  <div class="orbs"><i class="orb"></i><span id="cycle">connecting…</span></div>
+
+  <div class="stats">
+    <div class="stat" id="st-hosts"><b>—</b>hosts up</div>
+    <div class="stat"><b id="s-svc">—</b>services</div>
+    <div class="stat"><b id="s-probes">—</b>probes/cycle</div>
+    <div class="stat"><b id="s-p50">—</b>p50</div>
+    <div class="stat"><b id="s-cost">—</b>cycle time</div>
+  </div>
+
+  <div class="actions">
+    <button class="btn" id="probe-now" title="probe every host right now">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l2-7 3 14 3-9 2 2h4"/></svg>
+      <span>Probe now</span>
+    </button>
+    <button class="btn primary" id="add-open">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+      <span>Add host</span>
+    </button>
+  </div>
+</header>
+
+<main>
+  <div class="toolbar">
+    <div class="chips" id="filters">
+      <button class="chip on" data-f="all">All <span class="n" id="c-all"></span></button>
+      <button class="chip" data-f="down">Down <span class="n" id="c-down"></span></button>
+      <button class="chip" data-f="docker">Docker <span class="n" id="c-docker"></span></button>
+      <button class="chip" data-f="device">Network <span class="n" id="c-device"></span></button>
+      <button class="chip" data-f="ai">AI-tagged <span class="n" id="c-ai"></span></button>
+    </div>
+    <div class="search">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="q" placeholder="filter host, ip, port or app…  /">
+    </div>
+  </div>
+  <div class="hint" id="hint"></div>
+  <section class="grid" id="grid"></section>
+</main>
+
+<div class="backdrop" id="backdrop"></div>
+<aside id="panel" aria-label="host detail"></aside>
+<div class="toasts" id="toasts"></div>
+
+<div class="modal" id="modal">
+  <div class="sheet">
+    <div class="sh">
+      <h3>Add a host to scan</h3>
+      <button class="close btn" id="add-close" style="width:28px;height:28px;padding:0;justify-content:center">✕</button>
+    </div>
+    <form id="add-form">
+      <div class="field">
+        <label>How should netwatch reach it?</label>
+        <div class="seg" id="kind-seg">
+          <button type="button" data-k="url" class="on">HTTP / IP</button>
+          <button type="button" data-k="ssh">SSH</button>
+          <button type="button" data-k="local">This machine</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>Address</label>
+        <input id="f-address" placeholder="192.168.2.237 or nas.local" autocomplete="off" required>
+        <div class="hint2">IP or hostname. Scheme and path are stripped.</div>
+      </div>
+      <div class="field" id="f-ssh-wrap" style="display:none">
+        <label>SSH target <span style="color:var(--dim2)">(optional, unlocks docker)</span></label>
+        <input id="f-ssh" placeholder="root@192.168.2.237" autocomplete="off">
+        <div class="hint2">Key auth only: <code>ssh-copy-id</code> first. Without it you still get ports + HTTP.</div>
+      </div>
+      <div class="field">
+        <label>Label <span style="color:var(--dim2)">(optional)</span></label>
+        <input id="f-name" placeholder="gpu-host" autocomplete="off">
+      </div>
+      <div class="err" id="f-err"></div>
+      <div class="foot">
+        <button class="btn" type="button" id="add-cancel">Cancel</button>
+        <button class="btn primary" type="submit" id="add-submit">Scan it</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+/* ---------------- state ---------------- */
+const state = { hosts: [], interval: 60, cycle: 0, probes: 0, cost: 0, llm: false,
+                filter: 'all', q: '', sel: null, kind: 'url' };
+const cards = new Map();
+const el = id => document.getElementById(id);
+const POINTS = 90;
+
+const svcCount = h => h.services.filter(s => !s.noise).length;
+const isUp = h => !!h.up;
+const hostLat = h => h.lat;
+const slow = h => h.lat != null && (h.lat > 400 || h.services.some(s => s.up && s.lat > 900));
+const hist = h => h.history.map(x => x[1]);
+const fmt = n => n == null ? '—' : n < 10 ? (+n).toFixed(1) + ' ms' : Math.round(n) + ' ms';
+const pct = (a, b) => b ? (a / b * 100).toFixed(1) + '%' : '—';
+const p95 = arr => {
+  const v = arr.filter(x => x != null).slice().sort((a, b) => a - b);
+  return v.length ? v[Math.min(v.length - 1, Math.floor(v.length * 0.95))] : null;
+};
+const ago = ts => {
+  if (!ts) return 'never';
+  const s = Math.max(0, (Date.now() / 1000 - ts));
+  return s < 90 ? Math.round(s) + 's ago' : s < 5400 ? Math.round(s / 60) + 'm ago' : Math.round(s / 3600) + 'h ago';
+};
+
+function iconHTML(slug, name) {
+  const c = ['#4cc2ff', '#2ec27e', '#f2a33c', '#b48cff', '#ef4b5b'][(name || 'x').length % 5];
+  return `<div class="icon" style="--c:${c}">
+    <img src="https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/${slug || 'server'}.svg"
+         alt="" loading="lazy" onerror="this.remove()">
+    <span class="fb">${(name || '?')[0].toUpperCase()}</span></div>`;
+}
+
+/* ---------------- cards ---------------- */
+function cardHTML(h) {
+  const n = svcCount(h);
+  const kindTxt = h.kind === 'local' ? 'this host' : h.kind === 'ssh' ? (h.ssh || 'ssh') : 'http';
+  return `<article class="card" data-id="${h.id}">
+    <div class="c-top">
+      ${iconHTML(h.icon, h.name)}
+      <div class="c-id"><h3>${esc(h.name)}</h3><p>${esc(h.address)} · ${esc(kindTxt)}</p></div>
+      <i class="dot"></i>
+    </div>
+    <div class="c-tags">
+      <span class="tag">${n ? n + ' svc' : 'icmp'}</span>
+      ${h.by === 'llm' ? `<span class="tag ai">AI ${Math.round((h.conf || 0) * 100)}%</span>` : ''}
+      ${h.containers.length ? `<span class="tag">${h.containers.length} ctr</span>` : ''}
+    </div>
+    <div class="c-bot"><canvas class="spark"></canvas><span class="lat"></span></div>
+  </article>`;
+}
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+function render() {
+  el('grid').innerHTML = state.hosts.map(cardHTML).join('') ||
+    '<div class="empty">no hosts yet — click “Add host”</div>';
+  cards.clear();
+  el('grid').querySelectorAll('.card').forEach(c => cards.set(+c.dataset.id, c));
+  state.hosts.forEach(h => paintCard(h));
+  counts(); applyFilter();
+  const total = state.hosts.reduce((a, h) => a + svcCount(h), 0);
+  el('s-probes').textContent = state.probes;
+  el('s-cost').textContent = state.cost + ' ms';
+  const all = state.hosts.flatMap(hist).filter(v => v != null).sort((a, b) => a - b);
+  el('s-p50').textContent = fmt(all.length ? all[all.length >> 1] : null);
+  el('hint').textContent = `${state.hosts.length} hosts · ${total} services · probe every ${state.interval}s · click any card` +
+    (state.llm ? ' · LLM fallback on' : ' · LLM fallback off');
+  if (state.sel) openPanel(state.sel, true);
+}
+
+function paintCard(h) {
+  const c = cards.get(h.id); if (!c) return;
+  const up = isUp(h), sl = slow(h);
+  const cls = !up ? 'down' : sl ? 'warn' : '';
+  const dot = c.querySelector('.dot');
+  const want = 'dot ' + cls;
+  if (dot.className !== want) dot.className = want;
+  const latEl = c.querySelector('.lat');
+  const txt = up ? fmt(hostLat(h)) : 'offline';
+  if (latEl.textContent !== txt) latEl.textContent = txt;
+  latEl.classList.toggle('down', !up);
+  drawSpark(c.querySelector('.spark'), hist(h), !up ? '#ef4b5b' : sl ? '#f2a33c' : '#2ec27e');
+  const n = svcCount(h);
+  const tags = `<span class="tag">${n ? n + ' svc' : 'icmp'}</span>` +
+    (h.by === 'llm' ? `<span class="tag ai">AI ${Math.round((h.conf || 0) * 100)}%</span>` : '') +
+    (h.containers.length ? `<span class="tag">${h.containers.length} ctr</span>` : '') +
+    (h.scanning ? `<span class="tag scan-tag"><i class="spin"></i> ${h.scanning}</span>` : '') +
+    (!up ? '<span class="tag dn">down</span>' : '');
+  const t = c.querySelector('.c-tags');
+  if (t._v !== tags) { t.innerHTML = tags; t._v = tags; }
+}
+
+function counts() {
+  const up = state.hosts.filter(isUp).length;
+  el('st-hosts').querySelector('b').textContent = `${up}/${state.hosts.length}`;
+  el('st-hosts').className = 'stat' + (up < state.hosts.length ? ' bad' : '');
+  el('s-svc').textContent = state.hosts.reduce((a, h) => a + svcCount(h), 0);
+  el('c-all').textContent = state.hosts.length;
+  el('c-down').textContent = state.hosts.length - up;
+  el('c-docker').textContent = state.hosts.filter(h => h.containers.length).length;
+  el('c-device').textContent = state.hosts.filter(h => !h.containers.length).length;
+  el('c-ai').textContent = state.hosts.filter(h => h.by === 'llm').length;
+}
+
+function applyFilter() {
+  const q = state.q.toLowerCase();
+  let shown = 0;
+  state.hosts.forEach(h => {
+    const c = cards.get(h.id); if (!c) return;
+    let ok = state.filter === 'all' ? true
+      : state.filter === 'down' ? !isUp(h)
+      : state.filter === 'ai' ? h.by === 'llm'
+      : state.filter === 'docker' ? h.containers.length > 0
+      : h.containers.length === 0;
+    if (ok && q) {
+      ok = (h.name + ' ' + h.address + ' ' + h.os + ' ' +
+        h.services.map(s => s.p + ' ' + s.n + ' ' + s.prod).join(' ')).toLowerCase().includes(q);
+    }
+    c.style.display = ok ? '' : 'none';
+    if (ok) shown++;
+  });
+  let e = el('grid').querySelector('.empty');
+  if (!shown && state.hosts.length) {
+    if (!e) { e = document.createElement('div'); e.className = 'empty'; e.textContent = 'nothing matches'; el('grid').appendChild(e); }
+  } else if (e && shown) e.remove();
+}
+
+/* ---------------- canvas ---------------- */
+function fit(cv) {
+  const r = cv.getBoundingClientRect();
+  const d = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.round(r.width)), h = Math.max(1, Math.round(r.height));
+  if (cv.width !== w * d || cv.height !== h * d) { cv.width = w * d; cv.height = h * d; }
+  const c = cv.getContext('2d');
+  c.setTransform(d, 0, 0, d, 0, 0);
+  c.clearRect(0, 0, w, h);
+  return { c, w, h };
+}
+
+function drawSpark(cv, arr, color) {
+  if (!cv) return;
+  const { c, w, h } = fit(cv);
+  const v = arr.slice(-60).filter(x => x != null);
+  if (!v.length) {
+    c.strokeStyle = '#1b2530'; c.lineWidth = 1;
+    c.beginPath(); c.moveTo(0, h - 1); c.lineTo(w, h - 1); c.stroke();
+    return;
+  }
+  const max = Math.max(...v) * 1.15 || 1, min = Math.min(...v) * 0.7;
+  const a = arr.slice(-60), n = a.length, step = w / Math.max(1, n - 1);
+  const y = val => h - 2 - ((val - min) / (max - min || 1)) * (h - 4);
+  c.strokeStyle = color; c.lineWidth = 1.5; c.lineJoin = 'round';
+  c.beginPath();
+  let pen = false;
+  a.forEach((val, i) => {
+    if (val == null) { pen = false; return; }
+    if (!pen) { c.moveTo(i * step, y(val)); pen = true; } else c.lineTo(i * step, y(val));
+  });
+  c.stroke();
+}
+
+let hover = -1;
+function drawChart() {
+  const cv = el('chart'); if (!cv || !state.sel) return;
+  const h = state.hosts.find(x => x.id === state.sel); if (!h) return;
+  const { c, w, h: ht } = fit(cv);
+  const L = 34, R = 8, T = 8, B = 16, iw = w - L - R, ih = ht - T - B;
+  const arr = hist(h), vals = arr.filter(x => x != null);
+  const max = Math.max(10, ...vals) * 1.2, n = arr.length;
+  const x = i => L + (i / Math.max(1, n - 1)) * iw;
+  const y = v => T + ih - (v / max) * ih;
+  const span = Math.round((n - 1) * state.interval / 60);
+
+  c.font = '9px ui-monospace,monospace'; c.fillStyle = '#54677a'; c.strokeStyle = '#151f28'; c.lineWidth = 1;
+  [0, .5, 1].forEach(f => {
+    const yy = Math.round(T + ih * f) + .5;
+    c.beginPath(); c.moveTo(L, yy); c.lineTo(w - R, yy); c.stroke();
+    c.fillText(Math.round(max * (1 - f)) + 'ms', 2, yy + 3);
+  });
+  ['-' + span + 'm', '-' + Math.round(span * 2 / 3) + 'm', '-' + Math.round(span / 3) + 'm', 'now']
+    .forEach((lbl, i) => c.fillText(lbl, L + (iw * i / 3) - (i === 3 ? 16 : i === 0 ? 0 : 8), ht - 3));
+
+  let pen = false, first = null, lastX = 0;
+  c.beginPath();
+  arr.forEach((v, i) => {
+    if (v == null) { pen = false; return; }
+    if (!pen) { c.moveTo(x(i), y(v)); pen = true; first = first ?? x(i); }
+    else c.lineTo(x(i), y(v));
+    lastX = x(i);
+  });
+  if (first != null) {
+    c.save(); c.lineTo(lastX, T + ih); c.lineTo(first, T + ih); c.closePath();
+    const g = c.createLinearGradient(0, T, 0, T + ih);
+    g.addColorStop(0, 'rgba(76,194,255,.18)'); g.addColorStop(1, 'rgba(76,194,255,0)');
+    c.fillStyle = g; c.fill(); c.restore();
+  }
+  c.beginPath(); pen = false;
+  arr.forEach((v, i) => {
+    if (v == null) { pen = false; return; }
+    if (!pen) { c.moveTo(x(i), y(v)); pen = true; } else c.lineTo(x(i), y(v));
+  });
+  c.strokeStyle = isUp(h) ? '#4cc2ff' : '#ef4b5b'; c.lineWidth = 1.6; c.lineJoin = 'round'; c.stroke();
+
+  const tip = el('chart-tip');
+  if (hover >= 0 && hover < n && arr[hover] != null) {
+    const px = x(hover), py = y(arr[hover]);
+    c.strokeStyle = 'rgba(120,160,190,.35)'; c.setLineDash([2, 3]);
+    c.beginPath(); c.moveTo(px, T); c.lineTo(px, T + ih); c.stroke(); c.setLineDash([]);
+    c.fillStyle = '#4cc2ff'; c.beginPath(); c.arc(px, py, 2.4, 0, 7); c.fill();
+    tip.style.opacity = 1;
+    tip.style.left = Math.min(w - 40, Math.max(36, px)) + 'px';
+    tip.style.top = py + 'px';
+    tip.textContent = fmt(arr[hover]) + ' · -' + Math.round((n - 1 - hover) * state.interval / 60) + 'm';
+  } else if (tip) tip.style.opacity = 0;
+}
+
+/* ---------------- panel ---------------- */
+function openPanel(id, keep) {
+  state.sel = id;
+  const h = state.hosts.find(x => x.id === id); if (!h) return;
+  const p = el('panel');
+  const scroller = keep ? p.scrollTop : 0;
+  p.innerHTML = panelHTML(h);
+  p.classList.add('on'); el('backdrop').classList.add('on');
+  cards.forEach(c => c.classList.toggle('sel', +c.dataset.id === id));
+  p.scrollTop = scroller;
+
+  p.querySelector('.close').onclick = closePanel;
+  p.querySelector('[data-act="rescan"]').onclick = () => scan(id, false);
+  p.querySelector('[data-act="deep"]').onclick = () => scan(id, true);
+  p.querySelector('[data-act="llm"]').onclick = () => scan(id, false, true);
+  p.querySelector('[data-act="del"]').onclick = async () => {
+    if (!confirm(`Remove ${h.name} (${h.address}) from monitoring?`)) return;
+    await fetch('/api/hosts/' + id, { method: 'DELETE' });
+    closePanel(); await load(); toast('Removed ' + h.name, 'info');
+  };
+  p.querySelector('[data-act="ssh"]')?.addEventListener('click', () => navigator.clipboard?.writeText('ssh ' + (h.ssh || h.address)).then(() => toast('Copied ssh command', 'info')));
+  p.querySelector('[data-act="open"]')?.addEventListener('click', () => {
+    const web = h.services.find(s => !s.noise && [80, 443, 3000, 8000, 8080, 8443, 8888, 9090].includes(s.p));
+    if (web) window.open(`${web.p === 443 || web.p === 8443 ? 'https' : 'http'}://${h.address}:${web.p}/`, '_blank');
+    else toast('No web port found on ' + h.name, 'info');
+  });
+
+  const cv = el('chart');
+  if (cv) {
+    cv.addEventListener('mousemove', e => {
+      const r = cv.getBoundingClientRect();
+      const iw = r.width - 34 - 8;
+      hover = Math.max(0, Math.min(hist(h).length - 1, Math.round(((e.clientX - r.left) - 34) / iw * (hist(h).length - 1))));
+      drawChart();
+    });
+    cv.addEventListener('mouseleave', () => { hover = -1; drawChart(); });
+    requestAnimationFrame(drawChart);
+  }
+
+  const t = p.querySelector('.js-toggle');
+  if (t) t.onclick = () => {
+    p.dataset.all = p.dataset.all === '1' ? '0' : '1';
+    p.querySelector('.js-ports').innerHTML = portsRows(h, p.dataset.all === '1');
+    t.textContent = p.dataset.all === '1' ? 'hide weak-signal ports' : `show all ${h.services.length} ports`;
+  };
+}
+
+function closePanel() {
+  state.sel = null;
+  el('panel').classList.remove('on');
+  el('backdrop').classList.remove('on');
+  cards.forEach(c => c.classList.remove('sel'));
+}
+
+function portsRows(h, all) {
+  const list = h.services.filter(s => all || !s.noise);
+  if (!list.length) return `<tr><td colspan="4" class="muted">no open TCP ports — ICMP only</td></tr>`;
+  return list.map(s => `<tr>
+    <td class="num">${s.p}/tcp</td>
+    <td>${esc(s.n)}${s.prod ? `<span class="muted"> · ${esc(s.prod)}${s.ver ? ' ' + esc(s.ver) : ''}</span>` : ''}</td>
+    <td><span class="src ${esc(s.src)}">${esc(s.src)}</span></td>
+    <td class="num" style="color:${s.up ? 'var(--up)' : 'var(--down)'}">${s.up ? 'open' : 'closed'}</td>
+  </tr>`).join('');
+}
+
+function panelHTML(h) {
+  const up = isUp(h), sl = slow(h), lat = hostLat(h);
+  const stTxt = !up ? 'offline' : sl ? 'degraded' : 'online';
+  const weak = h.services.filter(s => s.noise).length;
+  const note = h.by === 'docker'
+    ? 'Identified from docker image names and published port mappings — the strongest signal available.'
+    : h.by === 'llm'
+    ? `Named by the LLM fallback (confidence ${Math.round((h.conf || 0) * 100)}%), cached by fingerprint hash so it costs one call. Verify before trusting.`
+    : h.by === 'fp'
+    ? 'Identified from HTTP fingerprint: page title, Server header, favicon and login page text.'
+    : 'Identified from TCP banners and the port table. No HTTP metadata was available.';
+  const ev = [].concat(...h.services.map(s => s.ev || [])).slice(0, 10);
+  return `
+  <div class="p-head">
+    ${iconHTML(h.icon, h.name)}
+    <div style="min-width:0">
+      <h2>${esc(h.name)}</h2>
+      <div class="sub">${esc(h.address)} · ${svcCount(h)} services · ${h.containers.length ? h.containers.length + ' containers' : h.kind.toUpperCase()}</div>
+    </div>
+    <button class="close" title="close (esc)">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
+  </div>
+  <div class="p-body">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <span class="state ${!up ? 'down' : sl ? 'warn' : ''}">
+        <i style="width:6px;height:6px;border-radius:50%;background:currentColor;display:inline-block"></i>${stTxt}
+      </span>
+      ${h.scanning ? `<span class="state warn"><i class="spin"></i>&nbsp;${h.scanning} scan</span>` : ''}
+      <span class="muted" style="font:11px var(--mono)">scanned ${ago(h.scanned)}</span>
+    </div>
+
+    <p class="desc">${esc(h.descr || 'No description yet — run a scan.')}</p>
+
+    <div class="kpis">
+      <div class="kpi"><span>uptime</span><b>${pct(h.good, h.checks)}</b></div>
+      <div class="kpi"><span>latency</span><b style="color:${up ? 'var(--txt)' : 'var(--down)'}">${up ? fmt(lat) : '—'}</b></div>
+      <div class="kpi"><span>p95</span><b>${fmt(p95(hist(h)))}</b></div>
+      <div class="kpi"><span>ports</span><b>${svcCount(h)}</b></div>
+    </div>
+
+    <div>
+      <h4>Latency · last ${Math.round((h.history.length - 1) * state.interval / 60)} min</h4>
+      <div class="chartwrap"><canvas id="chart"></canvas><div class="chart-tip" id="chart-tip"></div></div>
+    </div>
+
+    <div>
+      <h4>Services · ${svcCount(h)} meaningful of ${h.services.length}</h4>
+      <table>
+        <thead><tr><th>port</th><th>service</th><th>source</th><th>state</th></tr></thead>
+        <tbody class="js-ports">${portsRows(h, false)}</tbody>
+      </table>
+      ${weak ? `<div><button class="ports-toggle js-toggle">show all ${h.services.length} ports</button></div>` : ''}
+    </div>
+
+    ${h.containers.length ? `<div>
+      <h4>Containers · via docker${h.ssh ? ' over SSH' : ''}</h4>
+      <div class="cont">${h.containers.map(c => `
+        <div class="row">
+          <div><div class="name">${esc(c.name)}</div><div class="img">${esc(c.image)}</div></div>
+          <div class="st"><span class="${/up|running/i.test(c.status) ? '' : 'bad'}">${esc(c.status)}</span>
+            <div class="img" style="text-align:right">${esc(c.ports)}</div></div>
+        </div>`).join('')}</div>
+    </div>` : ''}
+
+    <div>
+      <h4>Evidence</h4>
+      <div class="ev">${ev.length ? ev.map(e => `<code>${esc(e)}</code>`).join('') : '<span class="muted">nothing yet — scan the host</span>'}</div>
+    </div>
+
+    <div>
+      <h4>Identity</h4>
+      <div class="note">${note}</div>
+      <div class="ev" style="margin-top:7px">
+        <code>os: ${esc(h.os || 'unknown')}</code>
+        <code>kind: ${esc(h.kind)}</code>
+        <code>confidence: ${Math.round((h.conf || 0) * 100)}%</code>
+      </div>
+    </div>
+
+    <div class="p-actions">
+      <button class="btn" data-act="rescan">Rescan</button>
+      <button class="btn" data-act="deep">Deep scan (all ports)</button>
+      ${state.llm ? '<button class="btn" data-act="llm">Re-identify (LLM)</button>' : ''}
+      ${h.kind !== 'none' ? '<button class="btn" data-act="ssh">Copy ssh</button>' : ''}
+      <button class="btn" data-act="open">Open</button>
+      <button class="btn" data-act="del" style="margin-left:auto;color:#ffb0b8">Remove</button>
+    </div>
+  </div>`;
+}
+
+function refreshPanel() {
+  const h = state.hosts.find(x => x.id === state.sel); if (!h) return;
+  const p = el('panel'), s = p.querySelector('.state');
+  if (!s) return;
+  const up = isUp(h), sl = slow(h);
+  const cls = 'state ' + (!up ? 'down' : sl ? 'warn' : '');
+  if (s.className !== cls && !h.scanning) s.className = cls;
+  const k = p.querySelectorAll('.kpi b');
+  if (k.length === 4) {
+    k[0].textContent = pct(h.good, h.checks);
+    k[1].textContent = up ? fmt(hostLat(h)) : '—';
+    k[1].style.color = up ? 'var(--txt)' : 'var(--down)';
+    k[2].textContent = fmt(p95(hist(h)));
+  }
+  drawChart();
+}
+
+/* ---------------- network ---------------- */
+async function load() {
+  try {
+    const d = await (await fetch('/api/state')).json();
+    Object.assign(state, { hosts: d.hosts, interval: d.interval, cycle: d.cycle,
+                           probes: d.probes, cost: d.cost_ms, llm: d.llm });
+    render();
+    el('cycle').textContent = 'live · cycle ' + state.cycle;
+  } catch (e) {
+    el('cycle').textContent = 'disconnected';
+  }
+}
+
+function onTick(m) {
+  state.cycle = m.cycle; state.probes = m.probes; state.cost = m.cost_ms;
+  el('cycle').textContent = 'live · cycle ' + m.cycle;
+  el('s-probes').textContent = m.probes;
+  el('s-cost').textContent = m.cost_ms + ' ms';
+  const lats = [];
+  m.hosts.forEach(u => {
+    const h = state.hosts.find(x => x.id === u.id); if (!h) return;
+    h.up = u.up; h.lat = u.lat; h.checks = u.checks; h.good = u.good;
+    u.services.forEach(x => {
+      const s = h.services.find(y => y.p === x.p);
+      if (s) { s.up = x.up; s.lat = x.lat; }
+    });
+    h.history.push([Date.now() / 1000, u.lat]);
+    if (h.history.length > POINTS) h.history.shift();
+    if (u.lat != null) lats.push(u.lat);
+    paintCard(h);
+  });
+  lats.sort((a, b) => a - b);
+  el('s-p50').textContent = fmt(lats.length ? lats[lats.length >> 1] : null);
+  counts();
+  if (state.sel) refreshPanel();
+}
+
+function onScan(m) {
+  const h = state.hosts.find(x => x.id === m.host_id); if (!h) return;
+  if (m.state === 'start') {
+    h.scanning = m.deep ? 'deep' : 'quick';
+    paintCard(h);
+    if (state.sel === h.id) openPanel(h.id, true);
+    toast(`Scanning ${h.name} — ${m.deep ? 'all 65535 ports, ~1 min' : 'common ports'}`, 'info');
+  } else if (m.state === 'done') {
+    h.scanning = null;
+    load().then(() => toast(`${h.name}: ${m.services} services found`, 'ok'));
+  } else {
+    h.scanning = null;
+    paintCard(h);
+    toast(`Scan failed on ${h.name}: ${m.error || 'unknown'}`, 'bad');
+  }
+}
+
+function toast(msg, kind) {
+  const box = el('toasts');
+  const d = document.createElement('div');
+  d.className = 'toast ' + kind;
+  const now = new Date();
+  d.innerHTML = `<span class="t">${now.toTimeString().slice(0, 8)}</span><span>${esc(msg)}</span>`;
+  box.appendChild(d);
+  while (box.children.length > 3) box.firstChild.remove();
+  setTimeout(() => d.remove(), 5000);
+}
+
+async function scan(id, deep, llm) {
+  const r = await fetch(`/api/hosts/${id}/scan?deep=${deep}`, { method: 'POST' });
+  const d = await r.json();
+  if (!d.ok) toast(d.reason || 'scan already running', 'info');
+}
+
+/* ---------------- add host ---------------- */
+function openAdd() {
+  el('modal').classList.add('on');
+  setTimeout(() => el('f-address').focus(), 30);
+}
+function closeAdd() { el('modal').classList.remove('on'); el('f-err').textContent = ''; }
+
+el('kind-seg').addEventListener('click', e => {
+  const b = e.target.closest('button[data-k]'); if (!b) return;
+  el('kind-seg').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+  state.kind = b.dataset.k;
+  el('f-ssh-wrap').style.display = state.kind === 'ssh' ? '' : 'none';
+  el('f-address').placeholder = state.kind === 'local' ? '127.0.0.1' : '192.168.2.237 or nas.local';
+});
+
+el('add-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const btn = el('add-submit');
+  btn.disabled = true; btn.innerHTML = '<i class="spin"></i> Saving';
+  try {
+    const r = await fetch('/api/hosts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: state.kind, address: el('f-address').value,
+                             name: el('f-name').value, ssh: el('f-ssh').value })
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'failed');
+    closeAdd(); el('add-form').reset();
+    toast('Added ' + d.address + ' — scanning now', 'ok');
+    await load();
+  } catch (err) {
+    el('f-err').textContent = err.message;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Scan it';
+  }
+});
+
+/* ---------------- wiring ---------------- */
+el('add-open').onclick = openAdd;
+el('add-close').onclick = closeAdd;
+el('add-cancel').onclick = closeAdd;
+el('modal').addEventListener('click', e => { if (e.target === el('modal')) closeAdd(); });
+el('probe-now').onclick = async () => { await fetch('/api/cycle', { method: 'POST' }); toast('Probing all hosts…', 'info'); };
+el('backdrop').onclick = closePanel;
+el('grid').addEventListener('click', e => {
+  const c = e.target.closest('.card'); if (c) openPanel(+c.dataset.id);
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { closePanel(); closeAdd(); }
+  if (e.key === '/' && document.activeElement !== el('q')) { e.preventDefault(); el('q').focus(); }
+});
+el('filters').addEventListener('click', e => {
+  const b = e.target.closest('.chip'); if (!b) return;
+  el('filters').querySelectorAll('.chip').forEach(x => x.classList.toggle('on', x === b));
+  state.filter = b.dataset.f; applyFilter();
+});
+el('q').addEventListener('input', e => { state.q = e.target.value.trim(); applyFilter(); });
+window.addEventListener('resize', () => {
+  state.hosts.forEach(h => {
+    const c = cards.get(h.id);
+    if (c) drawSpark(c.querySelector('.spark'), hist(h),
+      !isUp(h) ? '#ef4b5b' : slow(h) ? '#f2a33c' : '#2ec27e');
+  });
+  drawChart();
+});
+
+try {
+  const es = new EventSource('/api/stream');
+  es.onmessage = e => {
+    let m; try { m = JSON.parse(e.data); } catch { return; }
+    if (m.type === 'tick') onTick(m);
+    else if (m.type === 'scan') onScan(m);
+    else if (m.type === 'removed') load();
+    else if (m.type === 'hello') el('ver').textContent = 'live';
+  };
+  es.onerror = () => { el('cycle').textContent = 'reconnecting…'; };
+} catch (e) { /* EventSource unsupported */ }
+
+load();
+if (location.hash === '#add') openAdd();
+else if (/^#h\d+$/.test(location.hash)) openPanel(+location.hash.slice(2));
+</script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+netwatch.db
+netwatch.db-wal
+netwatch.db-shm
