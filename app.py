@@ -28,6 +28,7 @@ LLM = {
 
 store = Store()
 RT: dict[int, dict] = {}          # host_id -> {hist, svc, up, checks, good}
+RM: dict[int, dict] = {}          # monitor_id -> {hist, up, lat, status, checks, good}
 SUBS: list[asyncio.Queue] = []
 SCANS: dict[int, str] = {}
 TASKS: set[asyncio.Task] = set()
@@ -37,7 +38,7 @@ COST_MS = 0
 LOCK = asyncio.Lock()
 
 ADDR_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]{0,250})$")
-SSH_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]{0,31}@)?([A-Za-z0-9]([A-Za-z0-9._-]{0,250}))$")
+SSH_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]{0,31}@)?([A-Za-z0-9]([A-Za-z0-9._-]{0,250}))(:\d{1,5})?$")
 
 
 def rt(hid):
@@ -47,6 +48,15 @@ def rt(hid):
                    "svc": {}, "up": True,
                    "checks": up["checks"], "good": up["good"]}
     return RT[hid]
+
+
+def rmon(mid):
+    if mid not in RM:
+        up = store.muptime(mid)
+        RM[mid] = {"hist": deque(([t, l] for t, l in store.mhistory(mid, HISTORY)), maxlen=HISTORY),
+                   "up": up["checks"] > 0, "lat": None, "status": None,
+                   "checks": up["checks"], "good": up["good"]}
+    return RM[mid]
 
 
 async def broadcast(msg):
@@ -69,16 +79,25 @@ async def run_cycle():
         t0 = time.perf_counter()
         hosts = store.hosts()
         services = store.all_services()
+        mons = store.monitors()
+        mon_ports = {}
+        for m in mons:
+            if m["kind"] != "http" and m.get("host_id"):
+                mon_ports.setdefault(m["host_id"], set()).add(m["port"])
         PROBES = 0
         updates = []
+        by_host = {}
         for h in hosts:
             svcs = [s for s in services.get(h["id"], []) if not s["noise"]]
+            have = {s["port"] for s in svcs}
+            svcs += [{"port": p} for p in mon_ports.get(h["id"], set()) if p not in have]
             try:
                 up, lat, per = await scanner.probe_host(h["address"], h["id"], svcs,
                                                         local=h["kind"] == "local")
             except Exception:
                 up, lat, per = False, None, {}
             PROBES += max(1, len(svcs))
+            by_host[h["id"]] = per
             r = rt(h["id"])
             r["up"] = up
             r["svc"] = {p: {"up": ok, "lat": l} for p, (ok, l) in per.items()}
@@ -91,12 +110,34 @@ async def run_cycle():
                             "checks": r["checks"], "good": r["good"],
                             "services": [{"p": p, "up": v["up"], "lat": v["lat"]}
                                          for p, v in r["svc"].items()]})
+        # monitors: one result each, from the host probe or an HTTP request
+        now = time.time()
+        async def check_monitor(m):
+            if m["kind"] == "http":
+                return await scanner.http_check(m["url"])
+            up, lat = by_host.get(m.get("host_id"), {}).get(m.get("port"), (False, None))
+            return up, lat, None
+
+        results = await asyncio.gather(*(check_monitor(m) for m in mons)) if mons else []
+        mupdates, mrows = [], []
+        for m, (up, lat, status) in zip(mons, results):
+            r = rmon(m["id"])
+            r.update(up=up, lat=lat, status=status)
+            r["checks"] += 1
+            r["good"] += 1 if up else 0
+            r["hist"].append([now, lat])
+            mrows.append((m["id"], now, 1 if up else 0, lat, status))
+            mupdates.append({"id": m["id"], "up": up, "lat": lat, "status": status,
+                             "checks": r["checks"], "good": r["good"]})
+        if mrows:
+            store.log_mchecks(mrows)
+
         CYCLE += 1
         COST_MS = round((time.perf_counter() - t0) * 1000)
         if CYCLE % 60 == 0:
             store.prune()
         await broadcast({"type": "tick", "cycle": CYCLE, "probes": PROBES,
-                         "cost_ms": COST_MS, "hosts": updates})
+                         "cost_ms": COST_MS, "hosts": updates, "monitors": mupdates})
 
 
 async def cycle_loop():
@@ -161,7 +202,9 @@ def build_state():
                          "up": st.get("up", r["up"]), "lat": st.get("lat")})
         out.append({
             "id": h["id"], "name": h["name"] or h["address"], "address": h["address"], "kind": h["kind"],
-            "ssh": h["ssh"] or "", "icon": h["icon"] or "server", "os": h["os"] or "",
+            "ssh": h["ssh"] or "", "auth": h.get("ssh_auth") or "agent",
+            "ssh_key": h.get("ssh_key") or "",
+            "icon": h["icon"] or "server", "os": h["os"] or "",
             "by": h["by"] or "banner", "conf": h["conf"] or 0, "descr": h["descr"] or "",
             "up": r["up"], "lat": (svcs and next((s["lat"] for s in svcs if s["up"] and not s["noise"]), None))
                    or (r["hist"][-1][1] if r["hist"] else None),
@@ -171,8 +214,27 @@ def build_state():
             "scanning": SCANS.get(h["id"]),
             "scanned": h["scanned"] or 0,
         })
+    hmap = {h["id"]: h for h in hosts}
+    slug_of = {(h["id"], s["port"]): s.get("slug") for h in hosts for s in services.get(h["id"], [])}
+    monitors = []
+    for m in store.monitors():
+        r = rmon(m["id"])
+        host = hmap.get(m.get("host_id")) if m.get("host_id") else None
+        target = m["url"] if m["kind"] == "http" else (
+            f"{host['address']}:{m['port']}" if host else f":{m['port']}")
+        monitors.append({
+            "id": m["id"], "name": m["name"] or target,
+            "icon": (m["icon"] if m["icon"] not in ("", "server")
+                     else (slug_of.get((m.get("host_id"), m.get("port"))) or "server")),
+            "kind": m["kind"], "url": m["url"], "port": m["port"],
+            "host_id": m["host_id"], "host": (host["name"] or host["address"]) if host else "",
+            "address": host["address"] if host else "", "target": target,
+            "up": r["up"], "lat": r["lat"], "status": r["status"],
+            "checks": r["checks"], "good": r["good"],
+            "history": [[t, l] for t, l in r["hist"]],
+        })
     return {"interval": INTERVAL, "cycle": CYCLE, "probes": PROBES, "cost_ms": COST_MS,
-            "llm": bool(LLM["url"] and LLM["model"]), "hosts": out}
+            "llm": bool(LLM["url"] and LLM["model"]), "hosts": out, "monitors": monitors}
 
 
 @asynccontextmanager
@@ -238,11 +300,131 @@ async def stream():
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+class MonitorIn(BaseModel):
+    host_id: int | None = None
+    port: int | None = None
+    url: str = ""
+    name: str = ""
+
+
+async def probe_monitor_now(mid):
+    """First data point for a monitor the user just added."""
+    m = store.monitor(mid)
+    if not m:
+        return
+    if m["kind"] == "http":
+        up, lat, status = await scanner.http_check(m["url"])
+    else:
+        host = store.host(m["host_id"]) if m.get("host_id") else None
+        if not host:
+            return
+        addr = "127.0.0.1" if host["kind"] == "local" else host["address"]
+        ok, lat = await scanner.tcp_probe(addr, m["port"])
+        up, status = ok, None
+    r = rmon(mid)
+    r.update(up=up, lat=lat, status=status)
+    r["checks"] += 1
+    r["good"] += 1 if up else 0
+    now = time.time()
+    r["hist"].append([now, lat])
+    store.log_mchecks([(mid, now, 1 if up else 0, lat, status)])
+    await broadcast({"type": "monitors"})
+
+
+async def identify_monitor(mid):
+    """After a URL monitor is added, name it from its page/headers."""
+    m = store.monitor(mid)
+    if not m or m["kind"] != "http":
+        return
+    from urllib.parse import urlsplit
+    u = urlsplit(m["url"])
+    port = u.port or (443 if u.scheme == "https" else 80)
+    info = await scanner.http_probe(u.hostname, port, scheme=u.scheme)
+    text = " ".join([info.get("server", ""), info.get("title", ""), (info.get("body") or "")[:1500]])
+    hit = scanner._match(text) if text.strip() else None
+    name = m["name"]
+    if not name or name == u.hostname:
+        name = (info.get("title") or name or u.hostname)[:60]
+    store.update_monitor(mid, name=name, icon=(hit[1] if hit else m["icon"]))
+    await broadcast({"type": "monitor", "id": mid})
+
+
+@app.post("/api/monitors")
+async def add_monitor(body: MonitorIn):
+    url = body.url.strip()
+    if url:
+        if not re.match(r"^https?://[^\s]+$", url, re.I):
+            raise HTTPException(400, "url must start with http:// or https://")
+        if store.find_monitor(url=url):
+            raise HTTPException(409, "already monitored")
+        hostname = url.split("//", 1)[1].split("/")[0][:60]
+        mid = store.add_monitor(None, None, url, "http", body.name.strip()[:60] or hostname, "server")
+        rmon(mid)
+        spawn(identify_monitor(mid))
+        spawn(probe_monitor_now(mid))
+        return {"id": mid}
+    if not body.host_id or not body.port:
+        raise HTTPException(400, "host_id + port, or a url")
+    host = store.host(body.host_id)
+    if not host:
+        raise HTTPException(404, "no such host")
+    svc = next((s for s in store.services(body.host_id) if s["port"] == body.port), None)
+    if not svc:
+        raise HTTPException(404, "port not discovered on that host")
+    if store.find_monitor(body.host_id, body.port):
+        raise HTTPException(409, "already monitored")
+    mid = store.add_monitor(body.host_id, body.port, "", "tcp",
+                            body.name.strip()[:60] or svc["name"],
+                            svc.get("slug") or "server")
+    rmon(mid)
+    spawn(probe_monitor_now(mid))
+    return {"id": mid}
+
+
+@app.delete("/api/monitors/{mid}")
+async def del_monitor(mid: int):
+    if not store.monitor(mid):
+        raise HTTPException(404, "no such monitor")
+    store.delete_monitor(mid)
+    RM.pop(mid, None)
+    await broadcast({"type": "monitors"})
+    return {"ok": True}
+
+
 class HostIn(BaseModel):
     kind: Literal["local", "ssh", "url"] = "url"
     address: str
     name: str = ""
     ssh: str = ""
+    auth: Literal["agent", "key", "password"] = "agent"
+    ssh_key: str = ""
+    ssh_password: str = ""
+
+
+class HostPatch(BaseModel):
+    name: str | None = None
+    ssh: str | None = None
+    auth: Literal["agent", "key", "password"] | None = None
+    ssh_key: str | None = None
+    ssh_password: str | None = None
+
+
+def check_ssh(ssh, auth, key, password, require_password=False):
+    """Validate SSH options, return the expanded key path."""
+    if auth == "key":
+        if not key:
+            raise HTTPException(400, "key file path required")
+        path = os.path.expanduser(key.strip())
+        if not os.path.isfile(path):
+            raise HTTPException(400, f"key file not found: {path}")
+        key = path
+    if auth == "password" and require_password and not password:
+        raise HTTPException(400, "password required")
+    if (auth in ("key", "password") or key or password) and not ssh:
+        raise HTTPException(400, "ssh target required (user@host)")
+    if ssh and not SSH_RE.match(ssh):
+        raise HTTPException(400, "ssh must be user@host")
+    return key.strip()
 
 
 @app.post("/api/hosts")
@@ -256,14 +438,36 @@ async def add_host(body: HostIn):
         raise HTTPException(400, "address must be an IP or hostname")
     if store.find_host(raw):
         raise HTTPException(409, "host already added")
-    ssh = body.ssh.strip() or None
-    if ssh and not SSH_RE.match(ssh):
-        raise HTTPException(400, "ssh must be user@host")
+    ssh = body.ssh.strip()
+    key = check_ssh(ssh, body.auth, body.ssh_key, body.ssh_password, require_password=True)
     name = body.name.strip()[:60]  # empty is fine: discovery fills in rDNS/address
-    hid = store.add_host(name, raw, body.kind, ssh)
+    hid = store.add_host(name, raw, body.kind, ssh or None, key,
+                         body.ssh_password if ssh else "", body.auth if ssh else "agent")
     rt(hid)
     spawn(scan_job(hid))
     return {"id": hid, "address": raw}
+
+
+@app.patch("/api/hosts/{hid}")
+async def patch_host(hid: int, body: HostPatch):
+    h = store.host(hid)
+    if not h:
+        raise HTTPException(404, "no such host")
+    ssh = (body.ssh.strip() if body.ssh is not None else (h["ssh"] or ""))
+    auth = body.auth or (h["ssh_auth"] or "agent")
+    key = (body.ssh_key.strip() if body.ssh_key is not None else (h["ssh_key"] or ""))
+    pw = h["ssh_pass"] or ""
+    if body.ssh_password:          # blank means "keep the current one"
+        pw = body.ssh_password
+    key = check_ssh(ssh, auth, key, pw, require_password=(body.auth == "password" and not pw))
+    kw = {"ssh": ssh or None, "ssh_auth": auth, "ssh_key": key}
+    if body.ssh_password:
+        kw["ssh_pass"] = body.ssh_password
+    if body.name is not None:
+        kw["name"] = body.name.strip()[:60]
+    store.update_host(hid, **kw)
+    spawn(scan_job(hid))
+    return {"ok": True}
 
 
 @app.delete("/api/hosts/{hid}")
@@ -295,4 +499,5 @@ async def probe_now():
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "hosts": len(store.hosts()), "cycle": CYCLE, "interval": INTERVAL}
+    return {"ok": True, "hosts": len(store.hosts()), "monitors": len(store.monitors()),
+            "cycle": CYCLE, "interval": INTERVAL}

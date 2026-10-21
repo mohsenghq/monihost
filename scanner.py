@@ -16,6 +16,7 @@ import socket
 import ssl
 import time
 
+import asyncssh
 import httpx
 
 # ---------------------------------------------------------------- tables
@@ -121,11 +122,15 @@ APP_NAMES = {
     "neo4j": "Neo4j", "splunk": "Splunk", "nginx": "nginx", "pgvector": "pgvector",
     "scraper": "vxcontrol scraper", "pgexporter": "Postgres Exporter",
     "postgres-exporter": "Postgres Exporter", "gitea": "Gitea", "grafana": "Grafana",
+    "langfuse": "Langfuse", "keycloak": "Keycloak", "qdrant": "Qdrant", "flowise": "Flowise",
     "prometheus": "Prometheus", "nextcloud": "Nextcloud", "jellyfin": "Jellyfin",
     "ubuntu": "Ubuntu", "kube-state-metrics": "kube-state-metrics",
     "node-exporter": "node_exporter", "dcgm-exporter": "DCGM Exporter",
 }
 BASE_ICON = {"redis": "redis", "postgres": "postgresql", "postgresql": "postgresql",
+             "keycloak": "keycloak", "qdrant": "qdrant", "flowise": "flowise",
+             "mongo": "mongodb", "mongodb": "mongodb", "minio": "minio",
+             "openldap": "openldap", "langfuse": "server", "flower": "server",
              "neo4j": "neo4j", "splunk": "splunk", "nginx": "nginx", "grafana": "grafana",
              "prometheus": "prometheus", "gitea": "gitea", "jellyfin": "jellyfin",
              "nextcloud": "nextcloud", "mongo": "mongodb", "mysql": "mysql",
@@ -186,8 +191,8 @@ TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
 TAG_RE = re.compile(r"<[^>]+>")
 
 
-async def http_probe(address, port, timeout=4.0):
-    scheme = "https" if port in TLS_PORTS else "http"
+async def http_probe(address, port, timeout=4.0, scheme=None):
+    scheme = scheme or ("https" if port in TLS_PORTS else "http")
     url = f"{scheme}://{address}:{port}/"
     out = {"url": url, "status": None, "title": "", "server": "", "powered": "",
            "tls": "", "favicon": "", "body": "", "evidence": []}
@@ -232,6 +237,19 @@ async def http_probe(address, port, timeout=4.0):
     return out
 
 
+async def http_check(url, timeout=6.0):
+    """Probe one URL for a monitor. Returns (up, latency_ms, status)."""
+    t0 = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=timeout, follow_redirects=True,
+                                     headers={"User-Agent": "netwatch/1.0"}) as c:
+            r = await c.get(url)
+        ms = round((time.perf_counter() - t0) * 1000, 2)
+        return r.status_code < 500, ms, r.status_code
+    except Exception:
+        return False, None, None
+
+
 def _match(text):
     low = text.lower()
     for needle, name, slug, product, cat in SIGNATURES:
@@ -241,7 +259,7 @@ def _match(text):
 
 
 # ---------------------------------------------------------------- identify
-def identify(port, banner="", http=None, image=None):
+def identify(port, banner="", http=None, image=None, cname=""):
     """Return a service dict for one port."""
     ev = []
     src = "port"
@@ -252,9 +270,14 @@ def identify(port, banner="", http=None, image=None):
 
     if image:
         base = image.split("/")[-1].split(":")[0].lower()
-        name = APP_NAMES.get(base, base.replace("-", " ").replace("_", " "))
-        slug = BASE_ICON.get(base, "docker")
-        product, conf, src, noise = image, 0.95, "docker", False
+        if re.fullmatch(r"[0-9a-f]{12,64}", base) and cname:
+            # image is an untagged build id (docker run <sha>): the container name is all we have
+            name = cname.replace("-", " ").replace("_", " ")[:40]
+            slug, product, conf, src, noise = "docker", image[:40], 0.9, "docker", False
+        else:
+            name = APP_NAMES.get(base, base.replace("-", " ").replace("_", " "))
+            slug = BASE_ICON.get(base, "docker")
+            product, conf, src, noise = image, 0.95, "docker", False
         ev.append(f"docker image: {image}")
 
     text = " ".join(x for x in [
@@ -324,13 +347,7 @@ async def _run(cmd, timeout=10):
         return ""
 
 
-async def docker_ps(ssh_target=None):
-    cmd = ["docker", "ps", "--format", "'{{json .}}'"]
-    if ssh_target:
-        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
-               "-o", "StrictHostKeyChecking=accept-new", ssh_target,
-               "docker ps --format '{{json .}}'"]
-    raw = await _run(cmd)
+def _parse_docker(raw):
     out = []
     for line in raw.splitlines():
         line = line.strip().strip("'")
@@ -345,6 +362,55 @@ async def docker_ps(ssh_target=None):
                     "status": d.get("Status", "") + (f" · {d['State']}" if d.get("State") and d["State"] != "running" else ""),
                     "ports": d.get("Ports", "") or "—"})
     return out
+
+
+async def docker_local():
+    return _parse_docker(await _run(["docker", "ps", "--format", "'{{json .}}'"]))
+
+
+async def ssh_inventory(target, password="", key_path="", timeout=12):
+    """One SSH connection: docker containers + OS. Returns (containers, os, error).
+
+    Auth: password if given, else key_path, else the SSH agent / default keys.
+    """
+    user, _, host = target.partition("@")
+    if not host:
+        host, user = user, ""
+    port = 22
+    if ":" in host and host.rsplit(":", 1)[1].isdigit():
+        host, p = host.rsplit(":", 1)
+        port = int(p)
+    opts = {"known_hosts": None, "login_timeout": 8, "port": port}
+    if user:
+        opts["username"] = user
+    if password:
+        opts["password"] = password
+    elif key_path:
+        opts["client_keys"] = [os.path.expanduser(key_path)]
+    else:
+        # one default key beats "try every key in ~/.ssh" (sshds drop you at MaxAuthTries)
+        for cand in ("id_ed25519", "id_ecdsa", "id_rsa"):
+            p = os.path.expanduser(f"~/.ssh/{cand}")
+            if os.path.isfile(p):
+                opts["client_keys"] = [p]
+                break
+    try:
+        async with asyncssh.connect(host, **opts) as conn:
+            r = await conn.run("docker ps --format '{{json .}}'", check=False, timeout=timeout)
+            text = (r.stdout or "").strip()
+            containers = _parse_docker(text)
+            o = await conn.run("grep -m1 ^PRETTY_NAME /etc/os-release 2>/dev/null || uname -s",
+                               check=False, timeout=5)
+            osname = re.sub(r"^PRETTY_NAME=", "", (o.stdout or "").strip()).strip('"')[:60]
+            err = ""
+            if r.exit_status not in (0, None) and not text:
+                err = (r.stderr or "docker unavailable").strip().splitlines()[-1][:80]
+            return containers, osname, err
+    except asyncio.TimeoutError:
+        return [], "", "ssh timeout"
+    except Exception as e:
+        msg = str(e) or "failed"
+        return [], "", f"ssh: {type(e).__name__}: {msg[:60]}"
 
 
 def container_ports(containers, include_loopback=True):
@@ -363,10 +429,10 @@ def container_ports(containers, include_loopback=True):
             if rng:
                 a, b = int(rng.group(1)), int(rng.group(2))
                 for p in range(a, min(b, a + 99) + 1):
-                    m[p] = c.get("image", "")
+                    m[p] = {"image": c.get("image", ""), "name": c.get("name", "")}
                 continue
             for hp, _cp in PORT_MAP_RE.findall(entry):
-                m[int(hp)] = c.get("image", "")
+                m[int(hp)] = {"image": c.get("image", ""), "name": c.get("name", "")}
     return m
 
 
@@ -434,8 +500,12 @@ async def discover(host, deep=False, llm_cfg=None, identity_lookup=None):
     local = host.get("kind") == "local"
     probe_addr = "127.0.0.1" if local else address
     # docker is only meaningful for this machine or over SSH; otherwise skip it
-    docker_target = None if local else (host.get("ssh") or "")
-    containers = await docker_ps(docker_target) if (local or docker_target) else []
+    containers, remote_os, ssh_err = [], "", ""
+    if local:
+        containers = await docker_local()
+    elif host.get("ssh"):
+        containers, remote_os, ssh_err = await ssh_inventory(
+            host["ssh"], host.get("ssh_pass") or "", host.get("ssh_key") or "")
     published = container_ports(containers, include_loopback=local)
 
     ports = list(range(1, 65536)) if deep else sorted(COMMON_PORTS)
@@ -461,7 +531,8 @@ async def discover(host, deep=False, llm_cfg=None, identity_lookup=None):
                 banner = await banner_grab(probe_addr, p)
                 if banner.startswith("HTTP/"):
                     http = await http_probe(probe_addr, p)
-            s = identify(p, banner, http, published.get(p))
+            pub = published.get(p) or {}
+            s = identify(p, banner, http, pub.get("image"), pub.get("name", ""))
             if http and http.get("title") and not s.get("product"):
                 s["name"] = s["name"] or http["title"]
             if http:
@@ -490,7 +561,7 @@ async def discover(host, deep=False, llm_cfg=None, identity_lookup=None):
         name = await asyncio.to_thread(_rdns, address) or address
 
     text = " ".join((s.get("banner") or "") + " " + (s.get("product") or "") for s in services)
-    os_guess = _guess_os(text)
+    os_guess = _guess_os(text) or remote_os
 
     # LLM only for hosts we could not name from strong signals
     unknown = [s for s in services if s["name"].startswith("http") or s["name"].startswith("port ")]
@@ -515,6 +586,8 @@ async def discover(host, deep=False, llm_cfg=None, identity_lookup=None):
     descr += (": " + ", ".join(dict.fromkeys(apps))) if apps else " (no TCP services)"
     if containers:
         descr += f" · {len(containers)} docker containers"
+    if ssh_err:
+        descr += " · " + ssh_err
     if llm_meta and llm_meta.get("descr"):
         descr += " — " + llm_meta["descr"]
 

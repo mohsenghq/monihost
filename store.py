@@ -16,6 +16,9 @@ CREATE TABLE IF NOT EXISTS hosts(
   address TEXT NOT NULL,
   kind TEXT NOT NULL DEFAULT 'url',
   ssh TEXT,
+  ssh_key TEXT DEFAULT '',
+  ssh_pass TEXT DEFAULT '',
+  ssh_auth TEXT DEFAULT 'agent',
   icon TEXT DEFAULT 'server',
   os TEXT DEFAULT '',
   by TEXT DEFAULT 'banner',
@@ -32,6 +35,7 @@ CREATE TABLE IF NOT EXISTS services(
   product TEXT DEFAULT '',
   version TEXT DEFAULT '',
   src TEXT DEFAULT 'port',
+  slug TEXT DEFAULT '',
   conf REAL DEFAULT 0,
   noise INTEGER DEFAULT 0,
   evidence TEXT DEFAULT '[]',
@@ -43,6 +47,18 @@ CREATE TABLE IF NOT EXISTS containers(
 );
 CREATE TABLE IF NOT EXISTS checks(host_id INTEGER, ts REAL, up INTEGER, lat REAL);
 CREATE INDEX IF NOT EXISTS checks_host_ts ON checks(host_id, ts);
+CREATE TABLE IF NOT EXISTS monitors(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  host_id INTEGER,
+  port INTEGER,
+  url TEXT DEFAULT '',
+  kind TEXT DEFAULT 'tcp',
+  name TEXT DEFAULT '',
+  icon TEXT DEFAULT 'server',
+  created REAL
+);
+CREATE TABLE IF NOT EXISTS mchecks(monitor_id INTEGER, ts REAL, up INTEGER, lat REAL, status INTEGER);
+CREATE INDEX IF NOT EXISTS mchecks_mon_ts ON mchecks(monitor_id, ts);
 CREATE TABLE IF NOT EXISTS identities(
   fhash TEXT PRIMARY KEY, name TEXT, slug TEXT, category TEXT, descr TEXT, created REAL
 );
@@ -57,6 +73,14 @@ class Store:
         with self.lock:
             self.db.executescript(SCHEMA)
             self.db.execute("PRAGMA journal_mode=WAL")
+            cols = {r[1] for r in self.db.execute("PRAGMA table_info(hosts)")}
+            for col, ddl in (("ssh_key", "TEXT DEFAULT ''"), ("ssh_pass", "TEXT DEFAULT ''"),
+                             ("ssh_auth", "TEXT DEFAULT 'agent'")):
+                if col not in cols:  # database created before SSH auth existed
+                    self.db.execute(f"ALTER TABLE hosts ADD COLUMN {col} {ddl}")
+            scols = {r[1] for r in self.db.execute("PRAGMA table_info(services)")}
+            if "slug" not in scols:
+                self.db.execute("ALTER TABLE services ADD COLUMN slug TEXT DEFAULT ''")
             self.db.commit()
 
     # ---------- hosts ----------
@@ -74,11 +98,12 @@ class Store:
             r = self.db.execute("SELECT * FROM hosts WHERE address=?", (address,)).fetchone()
             return dict(r) if r else None
 
-    def add_host(self, name, address, kind, ssh=None):
+    def add_host(self, name, address, kind, ssh=None, ssh_key="", ssh_pass="", ssh_auth="agent"):
         with self.lock:
             cur = self.db.execute(
-                "INSERT INTO hosts(name,address,kind,ssh,created) VALUES(?,?,?,?,?)",
-                (name, address, kind, ssh, time.time()),
+                "INSERT INTO hosts(name,address,kind,ssh,ssh_key,ssh_pass,ssh_auth,created)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (name, address, kind, ssh, ssh_key, ssh_pass, ssh_auth, time.time()),
             )
             self.db.commit()
             return cur.lastrowid
@@ -120,11 +145,11 @@ class Store:
         with self.lock:
             self.db.execute("DELETE FROM services WHERE host_id=?", (hid,))
             self.db.executemany(
-                """INSERT INTO services(host_id,port,proto,name,product,version,src,conf,noise,evidence,banner)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                """INSERT INTO services(host_id,port,proto,name,product,version,src,slug,conf,noise,evidence,banner)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 [
                     (hid, s["port"], s.get("proto", "tcp"), s["name"], s.get("product", ""),
-                     s.get("version", ""), s.get("src", "port"), s.get("conf", 0),
+                     s.get("version", ""), s.get("src", "port"), s.get("slug", ""), s.get("conf", 0),
                      1 if s.get("noise") else 0, json.dumps(s.get("evidence", [])),
                      (s.get("banner") or "")[:300])
                     for s in services
@@ -145,6 +170,66 @@ class Store:
                 [(hid, c["name"], c["image"], c["status"], c["ports"]) for c in rows],
             )
             self.db.commit()
+
+    # ---------- monitors ----------
+    def monitors(self):
+        with self.lock:
+            return [dict(r) for r in self.db.execute("SELECT * FROM monitors ORDER BY id")]
+
+    def monitor(self, mid):
+        with self.lock:
+            r = self.db.execute("SELECT * FROM monitors WHERE id=?", (mid,)).fetchone()
+            return dict(r) if r else None
+
+    def find_monitor(self, host_id=None, port=None, url=""):
+        with self.lock:
+            if url:
+                r = self.db.execute("SELECT * FROM monitors WHERE url=?", (url,)).fetchone()
+            else:
+                r = self.db.execute("SELECT * FROM monitors WHERE host_id=? AND port=?",
+                                    (host_id, port)).fetchone()
+            return dict(r) if r else None
+
+    def add_monitor(self, host_id, port, url, kind, name, icon):
+        with self.lock:
+            cur = self.db.execute(
+                "INSERT INTO monitors(host_id,port,url,kind,name,icon,created) VALUES(?,?,?,?,?,?,?)",
+                (host_id, port, url, kind, name, icon, time.time()))
+            self.db.commit()
+            return cur.lastrowid
+
+    def update_monitor(self, mid, **kw):
+        if not kw:
+            return
+        cols = ", ".join(f"{k}=?" for k in kw)
+        with self.lock:
+            self.db.execute(f"UPDATE monitors SET {cols} WHERE id=?", (*kw.values(), mid))
+            self.db.commit()
+
+    def delete_monitor(self, mid):
+        with self.lock:
+            self.db.execute("DELETE FROM monitors WHERE id=?", (mid,))
+            self.db.execute("DELETE FROM mchecks WHERE monitor_id=?", (mid,))
+            self.db.commit()
+
+    def log_mchecks(self, rows):
+        with self.lock:
+            self.db.executemany(
+                "INSERT INTO mchecks(monitor_id,ts,up,lat,status) VALUES(?,?,?,?,?)", rows)
+            self.db.commit()
+
+    def mhistory(self, mid, limit=90):
+        with self.lock:
+            rows = list(self.db.execute(
+                "SELECT ts,lat FROM mchecks WHERE monitor_id=? ORDER BY ts DESC LIMIT ?", (mid, limit)))
+        return [[r[0], r[1]] for r in reversed(rows)]
+
+    def muptime(self, mid, days=7):
+        with self.lock:
+            r = self.db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(up),0) FROM mchecks WHERE monitor_id=? AND ts>?",
+                (mid, time.time() - days * 86400)).fetchone()
+        return {"checks": r[0], "good": r[1]}
 
     # ---------- checks ----------
     def log_checks(self, rows):
@@ -169,6 +254,7 @@ class Store:
     def prune(self, days=7):
         with self.lock:
             self.db.execute("DELETE FROM checks WHERE ts<?", (time.time() - days * 86400,))
+            self.db.execute("DELETE FROM mchecks WHERE ts<?", (time.time() - days * 86400,))
             self.db.commit()
 
     # ---------- identity cache ----------
